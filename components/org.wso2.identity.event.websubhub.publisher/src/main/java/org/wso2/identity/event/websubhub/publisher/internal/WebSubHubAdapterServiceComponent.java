@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, WSO2 LLC. (http://www.wso2.com).
+ * Copyright (c) 2024-2026, WSO2 LLC. (http://www.wso2.com).
  *
  * WSO2 LLC. licenses this file to you under the Apache License,
  * Version 2.0 (the "License"); you may not use this file except
@@ -33,6 +33,7 @@ import org.wso2.carbon.identity.organization.management.service.OrganizationMana
 import org.wso2.carbon.identity.subscription.management.api.service.EventSubscriber;
 import org.wso2.carbon.identity.topic.management.api.service.TopicManagementService;
 import org.wso2.carbon.identity.topic.management.api.service.TopicManager;
+import org.wso2.carbon.identity.webhook.management.api.service.WebhookManagementService;
 import org.wso2.carbon.identity.webhook.metadata.api.exception.WebhookMetadataException;
 import org.wso2.carbon.identity.webhook.metadata.api.service.EventAdapterMetadataService;
 import org.wso2.identity.event.websubhub.publisher.config.WebSubAdapterConfiguration;
@@ -163,5 +164,24 @@ public class WebSubHubAdapterServiceComponent {
 
         WebSubHubAdapterDataHolder.getInstance().setEventAdapterMetadataService(null);
         log.debug("EventAdapterMetadataService unset in WebSubHubAdapterDataHolder bundle.");
+    }
+
+    @Reference(
+            name = "webhook.management.service.component",
+            service = WebhookManagementService.class,
+            cardinality = ReferenceCardinality.MANDATORY,
+            policy = ReferencePolicy.DYNAMIC,
+            unbind = "unsetWebhookManagementService"
+    )
+    protected void setWebhookManagementService(WebhookManagementService webhookManagementService) {
+
+        WebSubHubAdapterDataHolder.getInstance().setWebhookManagementService(webhookManagementService);
+        log.debug("WebhookManagementService set in WebSubHubAdapterDataHolder bundle.");
+    }
+
+    protected void unsetWebhookManagementService(WebhookManagementService webhookManagementService) {
+
+        WebSubHubAdapterDataHolder.getInstance().setWebhookManagementService(null);
+        log.debug("WebhookManagementService unset in WebSubHubAdapterDataHolder bundle.");
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024-2025, WSO2 LLC. (http://www.wso2.com).
+ * Copyright (c) 2024-2026, WSO2 LLC. (http://www.wso2.com).
  *
  * WSO2 LLC. licenses this file to you under the Apache License,
  * Version 2.0 (the "License"); you may not use this file except
@@ -29,12 +29,23 @@ import org.apache.http.client.methods.HttpPost;
 import org.apache.http.util.EntityUtils;
 import org.slf4j.MDC;
 import org.wso2.carbon.context.PrivilegedCarbonContext;
+import org.wso2.carbon.identity.core.ServiceURLBuilder;
+import org.wso2.carbon.identity.core.URLBuilderException;
+import org.wso2.carbon.identity.core.context.IdentityContext;
+import org.wso2.carbon.identity.core.context.model.RootOrganization;
 import org.wso2.carbon.identity.core.util.IdentityTenantUtil;
+import org.wso2.carbon.identity.core.util.IdentityUtil;
 import org.wso2.carbon.identity.event.publisher.api.exception.EventPublisherException;
+import org.wso2.carbon.identity.event.publisher.api.exception.EventPublisherServerException;
 import org.wso2.carbon.identity.event.publisher.api.model.EventContext;
 import org.wso2.carbon.identity.event.publisher.api.model.SecurityEventTokenPayload;
 import org.wso2.carbon.identity.event.publisher.api.service.EventPublisher;
+import org.wso2.carbon.identity.organization.management.service.OrganizationManager;
+import org.wso2.carbon.identity.organization.management.service.exception.OrganizationManagementException;
+import org.wso2.carbon.identity.organization.management.service.util.OrganizationManagementUtil;
 import org.wso2.carbon.identity.topic.management.api.exception.TopicManagementException;
+import org.wso2.carbon.identity.webhook.management.api.exception.WebhookMgtException;
+import org.wso2.carbon.identity.webhook.management.api.model.Webhook;
 import org.wso2.carbon.utils.DiagnosticLog;
 import org.wso2.identity.event.websubhub.publisher.constant.WebSubHubAdapterConstants;
 import org.wso2.identity.event.websubhub.publisher.exception.WebSubAdapterException;
@@ -43,15 +54,20 @@ import org.wso2.identity.event.websubhub.publisher.internal.WebSubHubAdapterData
 import org.wso2.identity.event.websubhub.publisher.util.WebSubHubCorrelationLogUtils;
 
 import java.io.IOException;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
 import static java.util.Collections.emptyMap;
+import static java.util.Collections.emptySet;
 import static org.wso2.carbon.CarbonConstants.LogEventConstants.TENANT_ID;
 import static org.wso2.carbon.identity.application.authentication.framework.util.FrameworkUtils.CORRELATION_ID_MDC;
 import static org.wso2.carbon.identity.application.authentication.framework.util.FrameworkUtils.TENANT_DOMAIN;
 import static org.wso2.carbon.identity.event.publisher.api.constant.ErrorMessage.ERROR_CODE_CONSTRUCTING_HUB_TOPIC;
 import static org.wso2.carbon.identity.event.publisher.api.constant.ErrorMessage.ERROR_CODE_TOPIC_EXISTS_CHECK;
+import static org.wso2.identity.event.websubhub.publisher.constant.WebSubHubAdapterConstants.ErrorMessages.ERROR_ACTIVE_WEBHOOKS_RETRIEVAL;
 import static org.wso2.identity.event.websubhub.publisher.constant.WebSubHubAdapterConstants.Http.PUBLISH;
 import static org.wso2.identity.event.websubhub.publisher.util.WebSubHubAdapterUtil.buildURL;
 import static org.wso2.identity.event.websubhub.publisher.util.WebSubHubAdapterUtil.constructHubTopic;
@@ -81,16 +97,51 @@ public class WebSubEventPublisherImpl implements EventPublisher {
     public void publish(SecurityEventTokenPayload eventPayload, EventContext eventContext)
             throws EventPublisherException {
 
+        String eventTenantDomain = eventContext.getTenantDomain();
+        if (!isOrganizationAwarePublishing(eventTenantDomain)) {
+            publishToTenant(eventPayload, eventContext, eventTenantDomain, null);
+            return;
+        }
+        // A sub organization has no topic of its own, so the event goes to each webhook-owning organization's topic.
+        EventPublisherException firstFailure = null;
+        for (String ownerTenantDomain : resolveOwnerTenants(eventContext)) {
+            try {
+                publishToTenant(eventPayload, eventContext, ownerTenantDomain, ownerTenantDomain);
+            } catch (EventPublisherException e) {
+                // A failure for one organization must not stop the delivery to the others.
+                log.error("Error while publishing the event to the topic of tenant: " + ownerTenantDomain, e);
+                if (firstFailure == null) {
+                    firstFailure = e;
+                }
+            }
+        }
+        if (firstFailure != null) {
+            throw firstFailure;
+        }
+    }
+
+    /**
+     * Publishes the event to the hub topic of one organization.
+     *
+     * @param eventPayload         Event to publish.
+     * @param eventContext         Context of the event, which names the organization it was raised in.
+     * @param topicTenantDomain    Tenant of the organization whose topic the event is published to.
+     * @param ownerTenantDomain    Tenant of the organization owning the webhooks, or null to keep the handler's issuer.
+     * @throws EventPublisherException If the topic or the payload cannot be prepared.
+     */
+    private void publishToTenant(SecurityEventTokenPayload eventPayload, EventContext eventContext,
+                                 String topicTenantDomain, String ownerTenantDomain) throws EventPublisherException {
+
         try {
             // Build immutable per-publish values.
             final String topic = constructHubTopic(
                     eventContext.getEventUri(),
                     eventContext.getEventProfileName(),
                     eventContext.getEventProfileVersion(),
-                    eventContext.getTenantDomain());
+                    topicTenantDomain);
 
             final String url = buildURL(topic, getWebSubBaseURL(), PUBLISH);
-            final String bodyJson = MAPPER.writeValueAsString(eventPayload);
+            final String bodyJson = MAPPER.writeValueAsString(stampTransmitter(eventPayload, ownerTenantDomain));
 
             final String correlationId = getCorrelationID(eventPayload);
             final String tenantDomain = eventContext.getTenantDomain();
@@ -115,13 +166,85 @@ public class WebSubEventPublisherImpl implements EventPublisher {
         }
     }
 
+    /**
+     * Organizations owning a webhook subscribed to the event, each once, including ancestors of the event's one.
+     *
+     * @param eventContext Context of the event.
+     * @return Tenant domain of each such organization, in the order of their webhooks.
+     * @throws EventPublisherException If the subscribed webhooks cannot be retrieved.
+     */
+    private Set<String> resolveOwnerTenants(EventContext eventContext) throws EventPublisherException {
+
+        List<Webhook> activeWebhooks;
+        try {
+            // Not the active webhooks: a webhook of this adapter stays partially active once the hub accepts it.
+            activeWebhooks = WebSubHubAdapterDataHolder.getInstance().getWebhookManagementService()
+                    .getSubscriptionAcceptedWebhooksForOrganization(eventContext.getEventProfileName(),
+                            eventContext.getEventProfileVersion(), eventContext.getEventUri(),
+                            eventContext.getTenantDomain());
+        } catch (WebhookMgtException e) {
+            throw new EventPublisherServerException(ERROR_ACTIVE_WEBHOOKS_RETRIEVAL.getCode(),
+                    ERROR_ACTIVE_WEBHOOKS_RETRIEVAL.getMessage(),
+                    String.format(ERROR_ACTIVE_WEBHOOKS_RETRIEVAL.getDescription(), eventContext.getEventUri()), e);
+        }
+        if (activeWebhooks == null || activeWebhooks.isEmpty()) {
+            return emptySet();
+        }
+        Set<String> ownerTenants = new LinkedHashSet<>();
+        for (Webhook webhook : activeWebhooks) {
+            ownerTenants.add(webhook.getOwnerTenantDomain());
+        }
+        return ownerTenants;
+    }
+
+    /**
+     * The event stamped with the issuer of the organization owning the topic's webhooks, as it transmits it.
+     * The issuer set by the event handler is kept when no owner is given or its issuer cannot be resolved.
+     *
+     * @param eventPayload      Event as the handler built it.
+     * @param ownerTenantDomain Tenant of the organization owning the webhooks, or null to keep the handler's issuer.
+     * @return The event to transmit.
+     */
+    private static SecurityEventTokenPayload stampTransmitter(SecurityEventTokenPayload eventPayload,
+                                                              String ownerTenantDomain) {
+
+        if (ownerTenantDomain == null) {
+            return eventPayload;
+        }
+        try {
+            return eventPayload.toBuilder()
+                    .iss(resolveTransmitterIssuer(ownerTenantDomain))
+                    .build();
+        } catch (OrganizationManagementException | URLBuilderException e) {
+            log.warn("Could not resolve the transmitter issuer of tenant: " + ownerTenantDomain +
+                    ". The issuer set by the event handler is published instead.", e);
+            return eventPayload;
+        }
+    }
+
     @Override
     public boolean canHandleEvent(EventContext eventContext) throws EventPublisherException {
+
+        String eventTenantDomain = eventContext.getTenantDomain();
+        if (!isOrganizationAwarePublishing(eventTenantDomain)) {
+            return isTopicExists(eventContext, eventTenantDomain);
+        }
+        // A sub organization's event is published to the topics of the organizations owning its webhooks.
+        for (String ownerTenantDomain : resolveOwnerTenants(eventContext)) {
+            if (isTopicExists(eventContext, ownerTenantDomain)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isTopicExists(EventContext eventContext, String topicTenantDomain)
+            throws EventPublisherException {
 
         try {
             return WebSubHubAdapterDataHolder.getInstance().getTopicManagementService()
                     .isTopicExists(eventContext.getEventUri(), eventContext.getEventProfileName(),
-                            eventContext.getEventProfileVersion(), eventContext.getTenantDomain());
+                            eventContext.getEventProfileVersion(), topicTenantDomain);
         } catch (TopicManagementException e) {
             throw handleServerException(ERROR_CODE_TOPIC_EXISTS_CHECK, e,
                     WebSubHubAdapterConstants.WEB_SUB_HUB_ADAPTER_NAME);
@@ -308,5 +431,89 @@ public class WebSubEventPublisherImpl implements EventPublisher {
                 EntityUtils.consumeQuietly(response.getEntity());
             }
         }
+    }
+
+    /**
+     * Whether the event takes the organization aware flow: child organization subscription is enabled and the event
+     * was raised in a sub organization. Otherwise the event is published as before.
+     *
+     * @param tenantDomain Tenant the event was raised in.
+     * @return true if the event is published to the organizations owning its webhooks.
+     */
+    private static boolean isOrganizationAwarePublishing(String tenantDomain) {
+
+        return IdentityUtil.isChildOrganizationSubscriptionEnabled() && isSubOrganizationEvent(tenantDomain);
+    }
+
+    /**
+     * Whether the event was raised in a sub organization, whose webhooks can belong to ancestor organizations.
+     * When it cannot be determined, the event is published to the tenant's own webhooks only.
+     *
+     * @param tenantDomain Tenant the event was raised in.
+     * @return true if the tenant is a sub organization.
+     */
+    private static boolean isSubOrganizationEvent(String tenantDomain) {
+
+        try {
+            return OrganizationManagementUtil.isOrganization(tenantDomain);
+        } catch (OrganizationManagementException e) {
+            // Runs per event, so a persistent failure logs its stack trace only while debugging.
+            log.warn("Could not check whether tenant: " + tenantDomain + " is an organization: " + e.getMessage() +
+                    ". Publishing the event to the tenant's own webhooks only.");
+            if (log.isDebugEnabled()) {
+                log.debug("Organization check failure for tenant: " + tenantDomain, e);
+            }
+            return false;
+        }
+    }
+
+    /**
+     * Issuer naming the organization that owns a webhook: the tenant path of a root, or of a descendant within it.
+     * The organization lookups it needs are cached by the organization management service.
+     *
+     * @param ownerTenantDomain Tenant of the organization owning the webhook.
+     * @return The issuer to stamp on the token.
+     * @throws OrganizationManagementException If the owning organization or its root cannot be resolved.
+     * @throws URLBuilderException             If the public URL cannot be built.
+     */
+    private static String resolveTransmitterIssuer(String ownerTenantDomain)
+            throws OrganizationManagementException, URLBuilderException {
+
+        String rootTenantDomain = resolveRootTenantDomain(ownerTenantDomain);
+        String path;
+        if (StringUtils.equals(ownerTenantDomain, rootTenantDomain)) {
+            path = "/t/" + rootTenantDomain;
+        } else {
+            String owningOrganizationId = WebSubHubAdapterDataHolder.getInstance().getOrganizationManager()
+                    .resolveOrganizationId(ownerTenantDomain);
+            path = "/t/" + rootTenantDomain + "/o/" + owningOrganizationId;
+        }
+        return ServiceURLBuilder.create().addPath(path).build().getAbsolutePublicURL();
+    }
+
+    /**
+     * Root tenant of the owner's hierarchy, taken from the identity context when it carries one.
+     * Otherwise, it is looked up, since an event can be published from a thread without that context.
+     *
+     * @param ownerTenantDomain Tenant of the organization owning the webhook.
+     * @return Tenant domain of the root organization.
+     * @throws OrganizationManagementException If the root organization cannot be resolved.
+     */
+    private static String resolveRootTenantDomain(String ownerTenantDomain) throws OrganizationManagementException {
+
+        RootOrganization rootOrganization = IdentityContext.getThreadLocalIdentityContext().getRootOrganization();
+        if (rootOrganization != null && StringUtils.isNotBlank(rootOrganization.getAssociatedTenantDomain())) {
+            return rootOrganization.getAssociatedTenantDomain();
+        }
+        OrganizationManager organizationManager = WebSubHubAdapterDataHolder.getInstance().getOrganizationManager();
+        String primaryOrganizationId = organizationManager.getPrimaryOrganizationId(
+                organizationManager.resolveOrganizationId(ownerTenantDomain));
+        String rootTenantDomain = StringUtils.isBlank(primaryOrganizationId) ? null :
+                organizationManager.resolveTenantDomain(primaryOrganizationId);
+        if (StringUtils.isBlank(rootTenantDomain)) {
+            throw new OrganizationManagementException("Root organization of tenant: " + ownerTenantDomain +
+                    " cannot be resolved.");
+        }
+        return rootTenantDomain;
     }
 }
