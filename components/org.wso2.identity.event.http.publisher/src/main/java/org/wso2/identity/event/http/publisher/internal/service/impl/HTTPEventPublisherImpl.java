@@ -30,12 +30,17 @@ import org.apache.http.conn.ConnectTimeoutException;
 import org.apache.http.util.EntityUtils;
 import org.slf4j.MDC;
 import org.wso2.carbon.context.PrivilegedCarbonContext;
+import org.wso2.carbon.identity.core.ServiceURLBuilder;
+import org.wso2.carbon.identity.core.URLBuilderException;
+import org.wso2.carbon.identity.core.context.IdentityContext;
+import org.wso2.carbon.identity.core.context.model.RootOrganization;
 import org.wso2.carbon.identity.core.util.IdentityTenantUtil;
 import org.wso2.carbon.identity.event.publisher.api.exception.EventPublisherException;
 import org.wso2.carbon.identity.event.publisher.api.exception.EventPublisherServerException;
 import org.wso2.carbon.identity.event.publisher.api.model.EventContext;
 import org.wso2.carbon.identity.event.publisher.api.model.SecurityEventTokenPayload;
 import org.wso2.carbon.identity.event.publisher.api.service.EventPublisher;
+import org.wso2.carbon.identity.organization.management.service.exception.OrganizationManagementException;
 import org.wso2.carbon.identity.webhook.management.api.exception.WebhookMgtException;
 import org.wso2.carbon.identity.webhook.management.api.model.Webhook;
 import org.wso2.carbon.utils.DiagnosticLog;
@@ -51,6 +56,7 @@ import java.net.SocketTimeoutException;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static java.util.Collections.emptyMap;
 import static org.wso2.carbon.CarbonConstants.LogEventConstants.TENANT_ID;
@@ -66,6 +72,7 @@ import static org.wso2.identity.event.http.publisher.internal.util.HTTPCorrelati
 public class HTTPEventPublisherImpl implements EventPublisher {
 
     private static final Log log = LogFactory.getLog(HTTPEventPublisherImpl.class);
+    private static final Map<String, String> TRANSMITTER_ISSUERS = new ConcurrentHashMap<>();
 
     private static final ObjectMapper MAPPER = new ObjectMapper()
             .setSerializationInclusion(JsonInclude.Include.NON_NULL)
@@ -113,16 +120,6 @@ public class HTTPEventPublisherImpl implements EventPublisher {
         final Map<String, String> copiedMDCSnapshot =
                 MDC.getCopyOfContextMap() != null ? MDC.getCopyOfContextMap() : emptyMap();
 
-        final String bodyJson;
-        try {
-            bodyJson = MAPPER.writeValueAsString(eventPayload);
-        } catch (JsonProcessingException e) {
-            printPublisherDiagnosticLog(eventProfileName, eventProfileUri, events, null,
-                    HTTPAdapterConstants.LogConstants.ActionIDs.PUBLISH_EVENT, DiagnosticLog.ResultStatus.FAILED,
-                    "Failed to serialize HTTP adapter payload.");
-            return;
-        }
-
         final List<Webhook> activeWebhooks;
         try {
             activeWebhooks = HTTPAdapterDataHolder.getInstance().getWebhookManagementService()
@@ -145,6 +142,35 @@ public class HTTPEventPublisherImpl implements EventPublisher {
                         HTTPAdapterConstants.LogConstants.ActionIDs.PUBLISH_EVENT, DiagnosticLog.ResultStatus.FAILED,
                         "Failed to decrypt secret for webhook: " + webhook.getName() +
                                 ". Event will not be published to the endpoint: " + url);
+                continue;
+            }
+
+            // A Security Event Token names its transmitter, and the transmitter is the organization
+            // that owns this webhook -- for an event raised in a descendant and delivered to an
+            // ancestor's webhook, that is the ancestor. The token is therefore stamped and
+            // serialised per recipient rather than once per occurrence.
+            //
+            // Only the issuer varies. jti identifies the occurrence and is left as the handler set
+            // it, so the copies delivered to two webhooks share one identifier and a consumer behind
+            // both can still recognise them as the same event. RFC 8417 requires jti to be unique
+            // within an event feed, which holds: each webhook is its own feed.
+            final String bodyJson;
+            try {
+                SecurityEventTokenPayload.Builder transmission = eventPayload.toBuilder();
+                // A webhook read from the database always records its owner. A webhook built in
+                // memory does not, and there the issuer the handler resolved is the best available
+                // answer, so it is left alone rather than guessed at.
+                if (webhook.getOwnerTenantDomain() != null) {
+                    transmission.iss(resolveTransmitterIssuer(webhook.getOwnerTenantDomain()));
+                }
+                bodyJson = MAPPER.writeValueAsString(transmission.build());
+            } catch (JsonProcessingException | OrganizationManagementException
+                    | URLBuilderException e) {
+                log.error("Error while preparing the event for webhook: " + webhook.getId() +
+                        ". Event will not be published to the endpoint: " + url, e);
+                printPublisherDiagnosticLog(eventProfileName, eventProfileUri, events, url,
+                        HTTPAdapterConstants.LogConstants.ActionIDs.PUBLISH_EVENT, DiagnosticLog.ResultStatus.FAILED,
+                        "Failed to serialize HTTP adapter payload for webhook: " + webhook.getName());
                 continue;
             }
 
@@ -292,4 +318,59 @@ public class HTTPEventPublisherImpl implements EventPublisher {
             }
         }, clientManager.getAsyncCallbackExecutor());
     }
+
+    /**
+     * Resolve the issuer that names this transmitter for a webhook's owning organization.
+     * <p>
+     * A Security Event Token names its transmitter, and the transmitter is the organization that owns the
+     * webhook -- for an event raised in a descendant and delivered to an ancestor's webhook, that is the
+     * ancestor. The issuer is that organization's public URL: the tenant alone for the root of a hierarchy,
+     * and the tenant with the organization appended for anything below it.
+     * <p>
+     * The root of the hierarchy is read from the identity context rather than walked again, since the webhook
+     * owner is always in the same hierarchy as the event being published and the context already carries it.
+     * <p>
+     * Cached by the owning tenant, which determines the issuer on its own: a tenant belongs to exactly one
+     * hierarchy, so its root is a fixed property of it. Only an answer derived from a root organization that
+     * was actually on the thread is cached. Without one the root cannot be known here and the owner stands in
+     * for it, which is right for a root tenant and wrong for anything below it -- caching that would make the
+     * wrong issuer stick, so it is left uncached for a later call that has the context to resolve it. The
+     * cache is not bounded, which is acceptable because it holds one short string per organization that owns a
+     * webhook, and the value only changes with the server's host configuration.
+     *
+     * @param ownerTenantDomain Tenant of the organization owning the webhook.
+     * @return The issuer to stamp on the token.
+     * @throws OrganizationManagementException If the owning organization cannot be resolved.
+     * @throws URLBuilderException             If the public URL cannot be built.
+     */
+    private String resolveTransmitterIssuer(String ownerTenantDomain)
+            throws OrganizationManagementException, URLBuilderException {
+
+        String cached = TRANSMITTER_ISSUERS.get(ownerTenantDomain);
+        if (cached != null) {
+            return cached;
+        }
+
+        RootOrganization rootOrganization = IdentityContext.getThreadLocalIdentityContext().getRootOrganization();
+        boolean rootResolved = rootOrganization != null
+                && StringUtils.isNotBlank(rootOrganization.getAssociatedTenantDomain());
+        String rootTenantDomain = rootResolved ? rootOrganization.getAssociatedTenantDomain() : ownerTenantDomain;
+
+        String path;
+        if (StringUtils.equals(ownerTenantDomain, rootTenantDomain)) {
+            // The root of a hierarchy is addressed by its tenant alone.
+            path = "/t/" + rootTenantDomain;
+        } else {
+            String owningOrganizationId = HTTPAdapterDataHolder.getInstance().getOrganizationManager()
+                    .resolveOrganizationId(ownerTenantDomain);
+            path = "/t/" + rootTenantDomain + "/o/" + owningOrganizationId;
+        }
+
+        String issuer = ServiceURLBuilder.create().addPath(path).build().getAbsolutePublicURL();
+        if (rootResolved) {
+            TRANSMITTER_ISSUERS.put(ownerTenantDomain, issuer);
+        }
+        return issuer;
+    }
+
 }

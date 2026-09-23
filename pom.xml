@@ -405,7 +405,7 @@
     <properties>
         <carbon.kernel.version>4.10.53</carbon.kernel.version>
         <carbon.kernel.package.import.version.range>[4.6.0, 5.0.0)</carbon.kernel.package.import.version.range>
-        <carbon.identity.framework.version>7.8.476</carbon.identity.framework.version>
+        <carbon.identity.framework.version>7.11.236</carbon.identity.framework.version>
         <identity.outbound.adapter.version.range>[1.0.0, 2.0.0)</identity.outbound.adapter.version.range>
         <httpclient.httpcomponents.wso2.version>4.5.13.wso2v1</httpclient.httpcomponents.wso2.version>
         <httpclient.httpcomponents.wso2.version.range>[4.5.0, 5.0.0)</httpclient.httpcomponents.wso2.version.range>

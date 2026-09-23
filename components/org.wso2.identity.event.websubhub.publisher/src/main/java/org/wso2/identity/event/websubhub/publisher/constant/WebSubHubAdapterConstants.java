@@ -133,7 +133,9 @@ public class WebSubHubAdapterConstants {
                 "Error while resolving organization ID for tenant: %s."),
         ERROR_CONSTRUCTING_HUB_TOPIC("65015", "Error constructing WebSubHub topic.",
                 "Error constructing WebSubHub topic for channel: %s, event profile version: %s, " +
-                        "tenant domain: %s.");
+                        "tenant domain: %s."),
+        ERROR_ACTIVE_WEBHOOKS_RETRIEVAL("65016", "Error retrieving the webhooks subscribed to the channel.",
+                "Error retrieving the webhooks subscribed to channel: %s.");
 
         private static final String WEB_SUB_ADAPTER_ERROR_CODE_PREFIX = "WEBSUB-";
         private final String code;
