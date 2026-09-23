@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, WSO2 LLC. (http://www.wso2.com).
+ * Copyright (c) 2025-2026, WSO2 LLC. (http://www.wso2.com).
  *
  * WSO2 LLC. licenses this file to you under the Apache License,
  * Version 2.0 (the "License"); you may not use this file except
@@ -18,6 +18,7 @@
 
 package org.wso2.identity.event.http.publisher.internal.component;
 
+import org.wso2.carbon.identity.organization.management.service.OrganizationManager;
 import org.wso2.carbon.identity.webhook.management.api.service.WebhookManagementService;
 import org.wso2.carbon.identity.webhook.metadata.api.service.EventAdapterMetadataService;
 import org.wso2.identity.event.http.publisher.internal.config.HTTPAdapterConfiguration;
@@ -32,6 +33,7 @@ public class HTTPAdapterDataHolder {
     private HTTPAdapterConfiguration adapterConfiguration;
     private EventAdapterMetadataService eventAdapterMetadataService;
     private WebhookManagementService webhookManagementService;
+    private OrganizationManager organizationManager;
 
     private HTTPAdapterDataHolder() {
 
@@ -101,4 +103,25 @@ public class HTTPAdapterDataHolder {
 
         this.eventAdapterMetadataService = eventAdapterMetadataService;
     }
+
+    /**
+     * Get the organization manager.
+     *
+     * @return OrganizationManager instance.
+     */
+    public OrganizationManager getOrganizationManager() {
+
+        return organizationManager;
+    }
+
+    /**
+     * Set the organization manager.
+     *
+     * @param organizationManager OrganizationManager instance.
+     */
+    public void setOrganizationManager(OrganizationManager organizationManager) {
+
+        this.organizationManager = organizationManager;
+    }
+
 }

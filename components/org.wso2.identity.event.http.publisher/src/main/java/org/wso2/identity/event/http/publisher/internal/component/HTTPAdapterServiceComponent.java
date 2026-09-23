@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, WSO2 LLC. (http://www.wso2.com).
+ * Copyright (c) 2025-2026, WSO2 LLC. (http://www.wso2.com).
  *
  * WSO2 LLC. licenses this file to you under the Apache License,
  * Version 2.0 (the "License"); you may not use this file except
@@ -28,6 +28,7 @@ import org.osgi.service.component.annotations.Reference;
 import org.osgi.service.component.annotations.ReferenceCardinality;
 import org.osgi.service.component.annotations.ReferencePolicy;
 import org.wso2.carbon.identity.event.publisher.api.service.EventPublisher;
+import org.wso2.carbon.identity.organization.management.service.OrganizationManager;
 import org.wso2.carbon.identity.webhook.management.api.service.WebhookManagementService;
 import org.wso2.carbon.identity.webhook.metadata.api.exception.WebhookMetadataException;
 import org.wso2.carbon.identity.webhook.metadata.api.service.EventAdapterMetadataService;
@@ -115,4 +116,24 @@ public class HTTPAdapterServiceComponent {
         HTTPAdapterDataHolder.getInstance().setEventAdapterMetadataService(null);
         log.debug("EventAdapterMetadataService unset in HTTPAdapterDataHolder bundle.");
     }
+
+    @Reference(
+            name = "organization.management.service",
+            service = OrganizationManager.class,
+            cardinality = ReferenceCardinality.MANDATORY,
+            policy = ReferencePolicy.DYNAMIC,
+            unbind = "unsetOrganizationManager"
+    )
+    protected void setOrganizationManager(OrganizationManager organizationManager) {
+
+        HTTPAdapterDataHolder.getInstance().setOrganizationManager(organizationManager);
+        log.debug("OrganizationManager set in HTTPAdapterDataHolder bundle.");
+    }
+
+    protected void unsetOrganizationManager(OrganizationManager organizationManager) {
+
+        HTTPAdapterDataHolder.getInstance().setOrganizationManager(null);
+        log.debug("OrganizationManager unset in HTTPAdapterDataHolder bundle.");
+    }
+
 }

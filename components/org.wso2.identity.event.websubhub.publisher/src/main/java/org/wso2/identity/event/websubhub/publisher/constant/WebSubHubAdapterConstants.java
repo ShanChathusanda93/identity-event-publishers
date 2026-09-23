@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, WSO2 LLC. (http://www.wso2.com).
+ * Copyright (c) 2024-2026, WSO2 LLC. (http://www.wso2.com).
  *
  * WSO2 LLC. licenses this file to you under the Apache License,
  * Version 2.0 (the "License"); you may not use this file except
@@ -133,7 +133,9 @@ public class WebSubHubAdapterConstants {
                 "Error while resolving organization ID for tenant: %s."),
         ERROR_CONSTRUCTING_HUB_TOPIC("65015", "Error constructing WebSubHub topic.",
                 "Error constructing WebSubHub topic for channel: %s, event profile version: %s, " +
-                        "tenant domain: %s.");
+                        "tenant domain: %s."),
+        ERROR_ACTIVE_WEBHOOKS_RETRIEVAL("65016", "Error retrieving the webhooks subscribed to the channel.",
+                "Error retrieving the webhooks subscribed to channel: %s.");
 
         private static final String WEB_SUB_ADAPTER_ERROR_CODE_PREFIX = "WEBSUB-";
         private final String code;

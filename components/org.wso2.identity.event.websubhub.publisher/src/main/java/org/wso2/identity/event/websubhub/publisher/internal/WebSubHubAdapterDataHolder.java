@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, WSO2 LLC. (http://www.wso2.com).
+ * Copyright (c) 2024-2026, WSO2 LLC. (http://www.wso2.com).
  *
  * WSO2 LLC. licenses this file to you under the Apache License,
  * Version 2.0 (the "License"); you may not use this file except
@@ -20,6 +20,7 @@ package org.wso2.identity.event.websubhub.publisher.internal;
 
 import org.wso2.carbon.identity.organization.management.service.OrganizationManager;
 import org.wso2.carbon.identity.topic.management.api.service.TopicManagementService;
+import org.wso2.carbon.identity.webhook.management.api.service.WebhookManagementService;
 import org.wso2.carbon.identity.webhook.metadata.api.service.EventAdapterMetadataService;
 import org.wso2.identity.event.websubhub.publisher.config.WebSubAdapterConfiguration;
 
@@ -37,6 +38,7 @@ public class WebSubHubAdapterDataHolder {
     private OrganizationManager organizationManager;
     private TopicManagementService topicManagementService;
     private EventAdapterMetadataService eventAdapterMetadataService;
+    private WebhookManagementService webhookManagementService;
 
     private WebSubHubAdapterDataHolder() {
 
@@ -125,5 +127,25 @@ public class WebSubHubAdapterDataHolder {
     public void setEventAdapterMetadataService(EventAdapterMetadataService eventAdapterMetadataService) {
 
         this.eventAdapterMetadataService = eventAdapterMetadataService;
+    }
+
+    /**
+     * Get the webhook management service.
+     *
+     * @return WebhookManagementService instance.
+     */
+    public WebhookManagementService getWebhookManagementService() {
+
+        return webhookManagementService;
+    }
+
+    /**
+     * Set the webhook management service.
+     *
+     * @param webhookManagementService WebhookManagementService instance.
+     */
+    public void setWebhookManagementService(WebhookManagementService webhookManagementService) {
+
+        this.webhookManagementService = webhookManagementService;
     }
 }

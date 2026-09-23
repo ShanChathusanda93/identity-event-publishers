@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, WSO2 LLC. (http://www.wso2.com).
+ * Copyright (c) 2025-2026, WSO2 LLC. (http://www.wso2.com).
  *
  * WSO2 LLC. licenses this file to you under the Apache License,
  * Version 2.0 (the "License"); you may not use this file except
@@ -30,12 +30,20 @@ import org.apache.http.conn.ConnectTimeoutException;
 import org.apache.http.util.EntityUtils;
 import org.slf4j.MDC;
 import org.wso2.carbon.context.PrivilegedCarbonContext;
+import org.wso2.carbon.identity.core.ServiceURLBuilder;
+import org.wso2.carbon.identity.core.URLBuilderException;
+import org.wso2.carbon.identity.core.context.IdentityContext;
+import org.wso2.carbon.identity.core.context.model.RootOrganization;
 import org.wso2.carbon.identity.core.util.IdentityTenantUtil;
+import org.wso2.carbon.identity.core.util.IdentityUtil;
 import org.wso2.carbon.identity.event.publisher.api.exception.EventPublisherException;
 import org.wso2.carbon.identity.event.publisher.api.exception.EventPublisherServerException;
 import org.wso2.carbon.identity.event.publisher.api.model.EventContext;
 import org.wso2.carbon.identity.event.publisher.api.model.SecurityEventTokenPayload;
 import org.wso2.carbon.identity.event.publisher.api.service.EventPublisher;
+import org.wso2.carbon.identity.organization.management.service.OrganizationManager;
+import org.wso2.carbon.identity.organization.management.service.exception.OrganizationManagementException;
+import org.wso2.carbon.identity.organization.management.service.util.OrganizationManagementUtil;
 import org.wso2.carbon.identity.webhook.management.api.exception.WebhookMgtException;
 import org.wso2.carbon.identity.webhook.management.api.model.Webhook;
 import org.wso2.carbon.utils.DiagnosticLog;
@@ -113,14 +121,18 @@ public class HTTPEventPublisherImpl implements EventPublisher {
         final Map<String, String> copiedMDCSnapshot =
                 MDC.getCopyOfContextMap() != null ? MDC.getCopyOfContextMap() : emptyMap();
 
-        final String bodyJson;
-        try {
-            bodyJson = MAPPER.writeValueAsString(eventPayload);
-        } catch (JsonProcessingException e) {
-            printPublisherDiagnosticLog(eventProfileName, eventProfileUri, events, null,
-                    HTTPAdapterConstants.LogConstants.ActionIDs.PUBLISH_EVENT, DiagnosticLog.ResultStatus.FAILED,
-                    "Failed to serialize HTTP adapter payload.");
-            return;
+        // An organization aware event is stamped per webhook owner; any other event is serialized once.
+        final boolean organizationAwarePublishing = isOrganizationAwarePublishing(tenantDomain);
+        String sharedBodyJson = null;
+        if (!organizationAwarePublishing) {
+            try {
+                sharedBodyJson = MAPPER.writeValueAsString(eventPayload);
+            } catch (JsonProcessingException e) {
+                printPublisherDiagnosticLog(eventProfileName, eventProfileUri, events, null,
+                        HTTPAdapterConstants.LogConstants.ActionIDs.PUBLISH_EVENT, DiagnosticLog.ResultStatus.FAILED,
+                        "Failed to serialize HTTP adapter payload.");
+                return;
+            }
         }
 
         final List<Webhook> activeWebhooks;
@@ -146,6 +158,24 @@ public class HTTPEventPublisherImpl implements EventPublisher {
                         "Failed to decrypt secret for webhook: " + webhook.getName() +
                                 ". Event will not be published to the endpoint: " + url);
                 continue;
+            }
+
+            final String bodyJson;
+            if (organizationAwarePublishing) {
+                try {
+                    bodyJson = MAPPER.writeValueAsString(
+                            stampTransmitter(eventPayload, webhook.getOwnerTenantDomain()));
+                } catch (JsonProcessingException e) {
+                    log.error("Error while serializing the event for webhook: " + webhook.getId() +
+                            ". Event will not be published to the endpoint: " + url, e);
+                    printPublisherDiagnosticLog(eventProfileName, eventProfileUri, events, url,
+                            HTTPAdapterConstants.LogConstants.ActionIDs.PUBLISH_EVENT,
+                            DiagnosticLog.ResultStatus.FAILED,
+                            "Failed to serialize HTTP adapter payload for webhook: " + webhook.getName());
+                    continue;
+                }
+            } else {
+                bodyJson = sharedBodyJson;
             }
 
             sendWithRetries(eventProfileName, eventProfileUri, events,
@@ -291,5 +321,110 @@ public class HTTPEventPublisherImpl implements EventPublisher {
                 MDC.clear();
             }
         }, clientManager.getAsyncCallbackExecutor());
+    }
+
+    /**
+     * Whether the event takes the organization aware flow: child organization subscription is enabled and the event
+     * was raised in a sub organization. Otherwise the event is published as before.
+     *
+     * @param tenantDomain Tenant the event was raised in.
+     * @return true if the event is published to the organizations owning its webhooks.
+     */
+    private static boolean isOrganizationAwarePublishing(String tenantDomain) {
+
+        return IdentityUtil.isChildOrganizationSubscriptionEnabled() && isSubOrganizationEvent(tenantDomain);
+    }
+
+    /**
+     * Whether the event was raised in a sub organization, whose webhooks can belong to ancestor organizations.
+     * Assumed when it cannot be determined, since that flow also serves the organization's own webhooks.
+     *
+     * @param tenantDomain Tenant the event was raised in.
+     * @return true if the tenant is a sub organization, or if that cannot be determined.
+     */
+    private static boolean isSubOrganizationEvent(String tenantDomain) {
+
+        try {
+            return OrganizationManagementUtil.isOrganization(tenantDomain);
+        } catch (OrganizationManagementException e) {
+            log.warn("Could not check whether tenant: " + tenantDomain + " is an organization. Publishing the " +
+                    "event as one raised in a sub organization.", e);
+            return true;
+        }
+    }
+
+    /**
+     * The event stamped with the issuer of the organization owning the webhook, as that organization transmits it.
+     * The issuer set by the event handler is kept when the owner is not recorded or its issuer cannot be resolved.
+     *
+     * @param eventPayload      Event as the handler built it.
+     * @param ownerTenantDomain Tenant of the organization owning the webhook, or null when it is not recorded.
+     * @return The event to transmit.
+     */
+    private static SecurityEventTokenPayload stampTransmitter(SecurityEventTokenPayload eventPayload,
+                                                              String ownerTenantDomain) {
+
+        if (ownerTenantDomain == null) {
+            return eventPayload;
+        }
+        try {
+            return eventPayload.toBuilder()
+                    .iss(resolveTransmitterIssuer(ownerTenantDomain))
+                    .build();
+        } catch (OrganizationManagementException | URLBuilderException e) {
+            log.warn("Could not resolve the transmitter issuer of tenant: " + ownerTenantDomain +
+                    ". The issuer set by the event handler is published instead.", e);
+            return eventPayload;
+        }
+    }
+
+    /**
+     * Issuer naming the organization that owns a webhook: the tenant path of a root, or of a descendant within it.
+     * The organization lookups it needs are cached by the organization management service.
+     *
+     * @param ownerTenantDomain Tenant of the organization owning the webhook.
+     * @return The issuer to stamp on the token.
+     * @throws OrganizationManagementException If the owning organization or its root cannot be resolved.
+     * @throws URLBuilderException             If the public URL cannot be built.
+     */
+    private static String resolveTransmitterIssuer(String ownerTenantDomain)
+            throws OrganizationManagementException, URLBuilderException {
+
+        String rootTenantDomain = resolveRootTenantDomain(ownerTenantDomain);
+        String path;
+        if (StringUtils.equals(ownerTenantDomain, rootTenantDomain)) {
+            path = "/t/" + rootTenantDomain;
+        } else {
+            String owningOrganizationId = HTTPAdapterDataHolder.getInstance().getOrganizationManager()
+                    .resolveOrganizationId(ownerTenantDomain);
+            path = "/t/" + rootTenantDomain + "/o/" + owningOrganizationId;
+        }
+        return ServiceURLBuilder.create().addPath(path).build().getAbsolutePublicURL();
+    }
+
+    /**
+     * Root tenant of the owner's hierarchy, taken from the identity context when it carries one.
+     * Otherwise it is looked up, since an event can be published from a thread without that context.
+     *
+     * @param ownerTenantDomain Tenant of the organization owning the webhook.
+     * @return Tenant domain of the root organization.
+     * @throws OrganizationManagementException If the root organization cannot be resolved.
+     */
+    private static String resolveRootTenantDomain(String ownerTenantDomain) throws OrganizationManagementException {
+
+        RootOrganization rootOrganization = IdentityContext.getThreadLocalIdentityContext().getRootOrganization();
+        if (rootOrganization != null && StringUtils.isNotBlank(rootOrganization.getAssociatedTenantDomain())) {
+            return rootOrganization.getAssociatedTenantDomain();
+        }
+        OrganizationManager organizationManager = HTTPAdapterDataHolder.getInstance().getOrganizationManager();
+        String primaryOrganizationId = organizationManager.getPrimaryOrganizationId(
+                organizationManager.resolveOrganizationId(ownerTenantDomain));
+        String rootTenantDomain = StringUtils.isBlank(primaryOrganizationId) ? null :
+                organizationManager.resolveTenantDomain(primaryOrganizationId);
+        if (StringUtils.isBlank(rootTenantDomain)) {
+            throw new OrganizationManagementException("Root organization of tenant: " + ownerTenantDomain +
+                    " cannot be resolved.");
+        }
+        return rootTenantDomain;
     }
 }
